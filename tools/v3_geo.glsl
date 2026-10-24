@@ -673,6 +673,7 @@ vec3 canopyField(vec3 p, vec3 pa, float fw){   // pa = p anchored on the terrain
 //  and a cheap crossed-sine displacement drew regular stripes over the vegetated walls (v5 / v9). The canopy relief keeps the
 //  undisplaced mask; the cover / rock colour boundary is ragged.
 vec2 vegWarp(vec3 p, float s){ float w=uMC.y*smoothstep(1.,2.6,s); return w>0.?vec2(noise3(p*.33+1.7),noise3(p*.33+8.3))*2.2*w:vec2(0.); }
+float gDTrue=0.;   // true distance to the surface at the last terrSD / sceneSD evaluation (the returned field is scaled down for safe steps)
 float terrSD(vec3 p, float h, out float steepW){
   const float e=1.2;
   gCarpIn=0.;   // (r9 side) never stale (read back at the primary hit through gCarpHit)
@@ -681,7 +682,7 @@ float terrSD(vec3 p, float h, out float steepW){
   float ms=textureLod(uMS,(p.xz-uRect.xy)*uRect.w,0.).r;      // max slope nearby: keeps steps conservative next to cliffs
   float d=(p.y-h)/sqrt(1.+max(s2,ms*ms));
   steepW=smoothstep(.8,1.6,sqrt(s2));
-  if(d>=12.+1.5*gEpsM){ steepW=0.; return d-10.; }   // conservative bound for the relief below (r5 fix: the value returned at the threshold, 2 m + 1.5 gEpsM, stays above the march hit tolerance gEpsM as in crownSD / leafOct -- a plain 2 m was hit as a false shell ~10 m above far ridges on grazing rays once gEpsM > 2 m)
+  if(d>=12.+1.5*gEpsM){ steepW=0.; gDTrue=d-10.; return d-10.; }   // conservative bound for the relief below (r5 fix: the value returned at the threshold, 2 m + 1.5 gEpsM, stays above the march hit tolerance gEpsM as in crownSD / leafOct -- a plain 2 m was hit as a false shell ~10 m above far ridges on grazing rays once gEpsM > 2 m)
   {
     vec4 vm=VEG(p.xz);
     float bare=1.-smoothstep(.25,.75,vm.r);
@@ -705,6 +706,7 @@ float terrSD(vec3 p, float h, out float steepW){
       d-=(hc0-h)*hw/sqrt(1.+max(s2,ms*ms));
     }
     if(rw>.01) d=(d-rockDisp(p)*rw*.9*sqrt((1.+s2r)/(1.+max(s2,ms*ms))))*mix(1.,.6,rw);   // true perpendicular offset; steep relief -> shorter steps (no overshoot)
+    gDTrue=d/mix(1.,.6,rw)*sqrt((1.+max(s2,ms*ms))/(1.+s2r));
     float cw=smoothstep(.2,.6,vm.r)*smoothstep(.35,.0,vm.b)*(gVeg&&uDbgM!=85?1.:0.);   // (r9 side) 84 / 85: timing switches (palms / ground canopy off)
     if(cw>.01){
       vec3 sn=smoothNormal(p.xz);
@@ -719,7 +721,7 @@ float terrSD(vec3 p, float h, out float steepW){
       float lw=clamp(3.-gPix*20.,0.,1.)*cw;                   // leaves out to gPix ~.15 (the shadow pass, at gPix .32, stays cheap)
       if(uDbgM==20) lw=0.;
       if(lw>0.){ float dl=leafOct(p,.17,5.,dm+.05,2.); gCarpIn=max(smoothstep(-.03,.03,dl-dm-.6),smoothstep(.0,.5,-dm))*lw; dm=mix(dm,min(dl,dm+.6),lw); }
-      d=dm*sc*(gPix<.3?.55:.72);                               // coarse LOD (incl. the shadow pass): smoother field, longer steps
+      d=dm*sc*(gPix<.3?.55:.72); gDTrue=dm;                               // coarse LOD (incl. the shadow pass): smoother field, longer steps
     }
     steepW=rw;
   }
@@ -732,8 +734,10 @@ float sceneSD(vec3 p, out vec4 inf){
   float d=terrSD(p,h,sw);
   inf=vec4(sw,0.,0.,0.);
   if(gVeg&&p.y-h<ENV){
-    vec4 ti; float dt=uDbgM==22?1e9:treesSD(p,ti,d); if(dt<d){d=dt; inf=ti;}
-    vec4 bi; float db=uDbgM==23?1e9:bushSD(p,bi,d); if(db<d){d=db; inf=bi;}
+    float dT0=gDTrue;
+    vec4 ti; float dt=uDbgM==22?1e9:treesSD(p,ti,d); if(dt<d){d=dt; inf=ti; dT0=d;}
+    vec4 bi; float db=uDbgM==23?1e9:bushSD(p,bi,d); if(db<d){d=db; inf=bi; dT0=d;}
+    gDTrue=dT0;
   }
   return d;
 }
@@ -745,6 +749,10 @@ float gWhy=0., gIt=0.;
 float pkDbg(){ return uDbgM>=100?float(uDbgM-100):1.; }   // debug only (dbgm=100+k): LOD of a k x wider view, to inspect far LOD in a zoomed probe
 bool march(vec3 ro, vec3 rd, float tmin, float tmax, out float tHit, out vec4 inf){
   float t=tmin;
+  // step length scaled by a random factor per pixel, sample and frame: whether a step skips or lands in a thin canopy / relief
+  // layer on a steep slope was decided by the camera-relative step sequence, the same for whole bands of pixels, so bands of
+  // shadow crawled down the ridges as the camera moved (~0:35); random per ray, the accumulated samples average it instead
+  float rj=mix(.7,1.2,hash12(gl_FragCoord.xy*1.37+vec2(fract(uTime*.1)*997.,fract(uTime*.37)*613.)));
   float pk=uTan*2./uRes.y*pkDbg();
   inf=vec4(0);
   float lastD=1e9;
@@ -754,14 +762,19 @@ bool march(vec3 ro, vec3 rd, float tmin, float tmax, out float tHit, out vec4 in
     if(t>tmax){ gWhy=1.; gEpsM=0.; return false; }
     vec3 p=ro+rd*t;
     float hgt=p.y-H(p.xz);
-    if(hgt>ENV){ t+=max((hgt-ENV)*.5,.3+t*.0015); inEnv=false; continue; }
+    if(hgt>ENV){ t+=max((hgt-ENV)*.5*rj,.3+t*.0015); inEnv=false; continue; }
     inEnv=true;
     gPix=t*pk; gVeg=t<uVegRange;
     gEpsM=gPix*(.6+float(i)*.004);
     float d=sceneSD(p,inf);
     float eps=gPix*(.6+float(i)*(inf.w>3.5&&inf.w<4.5?.0015:.004));   // palm fronds: no growing hit tolerance (it fattened the see-through fringes into curtains)
-    if(d<eps){ for(int k=uZero;k<3;k++){ t+=d*.9; d=sceneSD(ro+rd*t,inf); } tHit=t; gEpsM=0.; gCarpHit=gCarpIn; return true; }
-    t+=max(d*.8,eps*.5);
+    if(d<eps){   // terrain hits: Newton steps on the true distance to a fixed two pixel footprints off the surface. The scaled-down field
+      // stopped short by a view-dependent ~0.5-6 footprints (eps grows with the step count, d shrinks with slope), so on steep
+      // canopy the shaded point floated in front of the slope and slid across it as the camera moved: crawling, banded shadows
+      float ca=max(dot(smoothNormal(p.xz),-rd),.25), off=gPix*2.; bool above=p.y-hgt>1.;   // not under the sea: a lifted hit left the water test
+      for(int k=uZero;k<3;k++){ float g=gDTrue; t+=above&&inf.w<.5&&abs(g)<1e4?clamp((g-off)/ca,-2.,6.):d*.9; d=sceneSD(ro+rd*t,inf); }
+      tHit=t; gEpsM=0.; gCarpHit=gCarpIn; return true; }
+    t+=max(d*.8*rj,eps*.5);
     lastD=d;
   }
   gWhy=3.; gEpsM=0.;
